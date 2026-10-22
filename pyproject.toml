@@ -1,0 +1,24 @@
+[project]
+name = "crawler"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "curl-cffi>=0.16.3",
+    "httpx>=0.28.1",
+    "instagrapi>=3.0.21",
+    "playwright>=1.63.0",
+    "pydantic>=2.12.5",
+    "python-dateutil>=2.9.0.post0",
+    "scrapetube>=2.6.0",
+    "twscrape>=0.20.1",
+    "yt-dlp>=2026.8.19",
+]
+
+[project.scripts]
+crawler = "crawler:main"
+
+[build-system]
+requires = ["uv_build>=0.12.14,<0.13.0"]
+build-backend = "uv_build"
