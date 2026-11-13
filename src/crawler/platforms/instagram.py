@@ -11,6 +11,7 @@ from typing import Any
 from playwright.async_api import Response, async_playwright
 
 from ..models import CrawledMention
+from ..utils.accounts import parse_account_target
 from ..utils.cookies import find_platform_cookie, to_playwright_storage_state
 from ..utils.snowflake import decode_instagram_shortcode
 
@@ -38,6 +39,35 @@ def _find_media_nodes_recursive(data: Any, results: list[dict]):
     elif isinstance(data, list):
         for item in data:
             _find_media_nodes_recursive(item, results)
+
+
+def _infer_ig_media_type(node: dict[str, Any]) -> str:
+    """Tentukan tipe media Instagram (video, carousel, image, text)."""
+    typename = node.get("__typename", "")
+    media_type = node.get("media_type")
+    if (
+        media_type == 8
+        or typename == "GraphSidecar"
+        or "carousel_media" in node
+        or "edge_sidecar_to_children" in node
+    ):
+        return "carousel"
+    if (
+        media_type == 2
+        or typename == "GraphVideo"
+        or node.get("is_video") is True
+        or "video_versions" in node
+        or node.get("product_type") == "clips"
+    ):
+        return "video"
+    if (
+        media_type == 1
+        or typename == "GraphImage"
+        or "image_versions2" in node
+        or "display_url" in node
+    ):
+        return "image"
+    return "text"
 
 
 def _parse_ig_media_node(node: dict[str, Any]) -> CrawledMention | None:
@@ -99,6 +129,7 @@ def _parse_ig_media_node(node: dict[str, Any]) -> CrawledMention | None:
         external_id=f"ig-{node_id}",
         url=post_url,
         content=caption_text.strip(),
+        media_type=_infer_ig_media_type(node),
         author=username,
         author_name=full_name,
         published_at=pub_date,
@@ -197,7 +228,7 @@ async def _scrape_instagram_playwright_async(
     target: str,
     is_hashtag: bool = True,
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     include_comments: bool = True,
     max_comments_per_post: int = 25,
     cookie_file: Path | str | None = None,
@@ -211,13 +242,23 @@ async def _scrape_instagram_playwright_async(
 
     storage_state = None
     if cookie_file and Path(cookie_file).is_file():
-        logger.info("Memuat cookie Instagram dari: %s", cookie_file)
+        logger.debug("Memuat cookie Instagram dari: %s", cookie_file)
         storage_state = to_playwright_storage_state(cookie_file)
 
     mentions: list[CrawledMention] = []
     seen_ids: set[str] = set()
+    main_post_count = 0
+
+    if is_hashtag:
+        clean_target = target.lstrip("#").strip()
+        nav_url = f"https://www.instagram.com/explore/tags/{clean_target}/"
+    else:
+        parsed_account = parse_account_target(target, "instagram")
+        clean_target = parsed_account.identifier
+        nav_url = parsed_account.url
 
     async def handle_response(response: Response):
+        nonlocal main_post_count
         url = response.url
         if "graphql" in url or "/api/v1/" in url:
             try:
@@ -227,18 +268,21 @@ async def _scrape_instagram_playwright_async(
                     nodes: list[dict] = []
                     _find_media_nodes_recursive(data, nodes)
                     for n in nodes:
+                        if max_posts is not None and main_post_count >= max_posts:
+                            break
                         m = _parse_ig_media_node(n)
                         if m and m.external_id not in seen_ids:
                             if since_date and m.published_at and m.published_at < since_date:
                                 continue
                             seen_ids.add(m.external_id)
                             mentions.append(m)
+                            main_post_count += 1
                             if on_mention:
                                 try:
                                     on_mention(m)
                                 except Exception as exc:
                                     logger.debug("Error on_mention IG: %s", exc)
-                            logger.info(
+                            logger.debug(
                                 "[Instagram] Terambil post: %s oleh @%s (%s likes)",
                                 m.external_id,
                                 m.author,
@@ -263,17 +307,11 @@ async def _scrape_instagram_playwright_async(
                                             except Exception as exc:
                                                 logger.debug("Error on_mention IG comment: %s", exc)
                                 if c_mentions:
-                                    logger.info("  [Instagram] Terambil %d komentar untuk post %s", len(c_mentions), m.external_id)
+                                    logger.debug("  [Instagram] Terambil %d komentar untuk post %s", len(c_mentions), m.external_id)
             except Exception as exc:
                 logger.debug("Error membaca response IG GraphQL: %s", exc)
 
-    clean_target = target.lstrip("#").strip()
-    if is_hashtag:
-        nav_url = f"https://www.instagram.com/explore/tags/{clean_target}/"
-    else:
-        nav_url = f"https://www.instagram.com/{clean_target}/"
-
-    logger.info("Membuka Instagram di URL: %s...", nav_url)
+    logger.debug("Membuka Instagram di URL: %s...", nav_url)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -299,11 +337,12 @@ async def _scrape_instagram_playwright_async(
             await page.wait_for_timeout(4000)
 
             scroll_count = 0
-            max_scrolls = max(8, (max_posts // 4) * 2)
+            max_scrolls = max(8, (max_posts // 4) * 2) if max_posts is not None else None
+            stagnant_limit = 5 if max_posts is None else 3
             stagnant_count = 0
             last_count = 0
 
-            while len(mentions) < max_posts and scroll_count < max_scrolls:
+            while (max_posts is None or main_post_count < max_posts) and (max_scrolls is None or scroll_count < max_scrolls):
                 if stop_event and stop_event.is_set():
                     logger.info("[Instagram] Proses dihentikan oleh sinyal pengguna.")
                     break
@@ -311,6 +350,8 @@ async def _scrape_instagram_playwright_async(
                 try:
                     post_links = await page.locator('a[href*="/p/"], a[href*="/reel/"]').all()
                     for pl in post_links:
+                        if max_posts is not None and main_post_count >= max_posts:
+                            break
                         if stop_event and stop_event.is_set():
                             break
                         href = await pl.get_attribute("href")
@@ -332,8 +373,8 @@ async def _scrape_instagram_playwright_async(
                                     alt_text = await img_el.first.get_attribute("alt") or ""
                                 
                                 # Coba ekstrak username dari alt text (misal: 'Photo by @user on ...' atau 'Photo by User on ...')
-                                author_from_alt = "instagram_user"
-                                author_name_from_alt = None
+                                author_from_alt = clean_target if not is_hashtag else "instagram_user"
+                                author_name_from_alt = clean_target if not is_hashtag else None
                                 m_alt_by = re.search(r"Photo (?:by|shared by) @?([a-zA-Z0-9_\.]+)", alt_text, re.IGNORECASE)
                                 if m_alt_by:
                                     author_from_alt = m_alt_by.group(1)
@@ -344,18 +385,20 @@ async def _scrape_instagram_playwright_async(
                                     external_id=ext_id,
                                     url=f"https://www.instagram.com/p/{shortcode}/",
                                     content=alt_text.strip(),
+                                    media_type="video" if "/reel/" in href else "image",
                                     author=author_from_alt,
                                     author_name=author_name_from_alt,
                                     published_at=pub_date,
                                     raw={"shortcode": shortcode},
                                 )
                                 mentions.append(mention_obj)
+                                main_post_count += 1
                                 if on_mention:
                                     try:
                                         on_mention(mention_obj)
                                     except Exception as exc:
                                         logger.debug("Error on_mention IG DOM: %s", exc)
-                                logger.info("[Instagram DOM] Terambil post link: /p/%s", shortcode)
+                                logger.debug("[Instagram DOM] Terambil post link: /p/%s", shortcode)
                 except Exception:
                     pass
 
@@ -370,14 +413,16 @@ async def _scrape_instagram_playwright_async(
                         break
                     await asyncio.sleep(0.1)
 
-                current_count = len(mentions)
+                current_count = main_post_count
                 if current_count == last_count:
                     stagnant_count += 1
-                    if stagnant_count >= 3:
-                        logger.info(
-                            "[Circuit Breaker] Tidak ada item Instagram baru setelah 3x scroll berturut-turut. "
-                            "Menghentikan scrolling (total terkumpul: %d).",
+                    if stagnant_count >= stagnant_limit:
+                        logger.debug(
+                            "[Circuit Breaker] Tidak ada item Instagram baru setelah %dx scroll berturut-turut. "
+                            "Menghentikan scrolling (total post: %d, total item: %d).",
+                            stagnant_limit,
                             current_count,
+                            len(mentions),
                         )
                         break
                 else:
@@ -389,17 +434,18 @@ async def _scrape_instagram_playwright_async(
         finally:
             await browser.close()
 
-    logger.info("Total item Instagram yang berhasil dikumpulkan: %d", len(mentions))
+    logger.debug("Total item Instagram yang berhasil dikumpulkan: %d", len(mentions))
     return mentions
 
 
 def scrape_instagram_hashtag(
     hashtag: str,
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     include_comments: bool = True,
     max_comments_per_post: int = 25,
     cookie_file: Path | str | None = None,
+    headless: bool = True,
     on_mention: Any = None,
     stop_event: Any = None,
 ) -> list[CrawledMention]:
@@ -413,7 +459,7 @@ def scrape_instagram_hashtag(
             include_comments=include_comments,
             max_comments_per_post=max_comments_per_post,
             cookie_file=cookie_file,
-            headless=True,
+            headless=headless,
             on_mention=on_mention,
             stop_event=stop_event,
         )
@@ -423,10 +469,11 @@ def scrape_instagram_hashtag(
 def scrape_instagram_user(
     username: str,
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     include_comments: bool = True,
     max_comments_per_post: int = 30,
     cookie_file: Path | str | None = None,
+    headless: bool = True,
     on_mention: Any = None,
     stop_event: Any = None,
 ) -> list[CrawledMention]:
@@ -440,7 +487,7 @@ def scrape_instagram_user(
             include_comments=include_comments,
             max_comments_per_post=max_comments_per_post,
             cookie_file=cookie_file,
-            headless=True,
+            headless=headless,
             on_mention=on_mention,
             stop_event=stop_event,
         )

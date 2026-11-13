@@ -10,6 +10,7 @@ from twscrape import API
 from twscrape.models import Tweet
 
 from ..models import CrawledMention
+from ..utils.accounts import parse_account_target
 from ..utils.cookies import extract_twitter_tokens, find_platform_cookie
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ async def _init_twscrape_pool(api: API, cookie_file: Path | str | None = None) -
     username = f"user_{auth_token[:8]}"
     try:
         await api.pool.add_account_cookies(username, cookies_str)
-        logger.info("Berhasil mendaftarkan akun X ke twscrape pool dari %s", cookie_file)
+        logger.debug("Berhasil mendaftarkan akun X ke twscrape pool dari %s", cookie_file)
         return True
     except Exception as exc:
         logger.error("Gagal menambahkan akun ke twscrape pool: %s", exc)
@@ -70,11 +71,20 @@ def _tweet_to_mention(tweet: Tweet) -> CrawledMention:
     if tweet.inReplyToTweetIdStr:
         parent_id = f"tw-{tweet.inReplyToTweetIdStr}"
 
+    media_type = "text"
+    media = getattr(tweet, "media", None)
+    if media:
+        if getattr(media, "videos", None) or getattr(media, "animated", None):
+            media_type = "video"
+        elif getattr(media, "photos", None):
+            media_type = "image"
+
     return CrawledMention(
         platform="x",
         external_id=f"tw-{tweet.id_str}",
         url=tweet.url or f"https://x.com/{username}/status/{tweet.id_str}",
         content=tweet.rawContent or "",
+        media_type=media_type,
         author=username,
         author_name=display_name,
         published_at=pub_date,
@@ -93,18 +103,19 @@ def _tweet_to_mention(tweet: Tweet) -> CrawledMention:
 
 
 async def _scrape_twitter_async(
-    query: str,
+    query: str = "",
     since_date: date | datetime | None = None,
     until_date: date | datetime | None = None,
-    max_tweets: int = 100,
+    max_tweets: int | None = 100,
     include_comments: bool = True,
     max_comments_per_tweet: int = 20,
     cookie_file: Path | str | None = None,
     db_file: Path | str | None = None,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
-    """Crawl tweet dan balasan/komentarnya menggunakan operator pencarian tanggal."""
+    """Crawl tweet dan balasan/komentarnya berdasarkan query pencarian atau akun."""
     if db_file is None:
         # Simpan database akun di folder cookies/ atau root crawler
         base_dir = Path(__file__).resolve().parent.parent.parent.parent
@@ -116,23 +127,59 @@ async def _scrape_twitter_async(
     if not ready:
         return []
 
-    # Susun search query dengan filter tanggal
-    search_parts = [query]
-    if since_date:
-        d_str = since_date.strftime("%Y-%m-%d") if hasattr(since_date, "strftime") else str(since_date)
-        search_parts.append(f"since:{d_str}")
-    if until_date:
-        d_str = until_date.strftime("%Y-%m-%d") if hasattr(until_date, "strftime") else str(until_date)
-        search_parts.append(f"until:{d_str}")
+    tw_limit = -1 if max_tweets is None else max_tweets
+    account_username: str | None = None
+    if account:
+        target = parse_account_target(account, "x")
+        account_username = target.identifier
 
-    search_query = " ".join(search_parts)
-    logger.info("Menjalankan pencarian X dengan query: '%s' (limit: %d, comments: %s)...", search_query, max_tweets, include_comments)
+    tweet_stream = None
+    if account_username and since_date is None and until_date is None:
+        try:
+            user = await api.user_by_login(account_username)
+            if user and getattr(user, "id", None):
+                logger.debug(
+                    "Mengambil semua tweet timeline akun X @%s (id=%s, limit=%s, comments=%s)...",
+                    account_username,
+                    user.id,
+                    "∞" if max_tweets is None else max_tweets,
+                    include_comments,
+                )
+                tweet_stream = api.user_tweets(user.id, limit=tw_limit)
+        except Exception as exc:
+            logger.debug("user_by_login gagal untuk @%s, fallback ke search: %s", account_username, exc)
+
+    if tweet_stream is None:
+        base_query = f"from:{account_username}" if account_username and not query else query
+        if not base_query:
+            logger.error("Platform X memerlukan argumen --query atau --account.")
+            return []
+
+        search_parts = [base_query]
+        if since_date:
+            d_str = since_date.strftime("%Y-%m-%d") if hasattr(since_date, "strftime") else str(since_date)
+            search_parts.append(f"since:{d_str}")
+        if until_date:
+            d_str = until_date.strftime("%Y-%m-%d") if hasattr(until_date, "strftime") else str(until_date)
+            search_parts.append(f"until:{d_str}")
+
+        search_query = " ".join(search_parts)
+        logger.debug(
+            "Menjalankan pencarian X dengan query: '%s' (limit: %s, comments: %s)...",
+            search_query,
+            "∞" if max_tweets is None else max_tweets,
+            include_comments,
+        )
+        tweet_stream = api.search(search_query, limit=tw_limit)
 
     mentions: list[CrawledMention] = []
     seen_ids: set[str] = set()
+    main_tweet_count = 0
 
     try:
-        async for tweet in api.search(search_query, limit=max_tweets):
+        async for tweet in tweet_stream:
+            if max_tweets is not None and main_tweet_count >= max_tweets:
+                break
             if stop_event and stop_event.is_set():
                 logger.info("[X/Twitter] Proses dihentikan oleh sinyal pengguna.")
                 break
@@ -146,6 +193,7 @@ async def _scrape_twitter_async(
             if mention.external_id not in seen_ids:
                 seen_ids.add(mention.external_id)
                 mentions.append(mention)
+                main_tweet_count += 1
                 if on_mention:
                     try:
                         on_mention(mention)
@@ -173,7 +221,7 @@ async def _scrape_twitter_async(
                         if reply_count >= max_comments_per_tweet:
                             break
                     if reply_count > 0:
-                        logger.info("  [X] Mengambil %d balasan/komentar untuk tweet %s", reply_count, tweet.id_str)
+                        logger.debug("  [X] Mengambil %d balasan/komentar untuk tweet %s", reply_count, tweet.id_str)
                 except Exception as exc:
                     logger.debug("Gagal mengambil balasan tweet %s: %s", tweet.id_str, exc)
 
@@ -184,26 +232,27 @@ async def _scrape_twitter_async(
                     if stop_event and stop_event.is_set():
                         break
                     await asyncio.sleep(0.1)
-            if len(mentions) % 25 == 0 or len(mentions) == max_tweets:
-                logger.info("Terkumpul %d item dari X (termasuk komentar)...", len(mentions))
+            if len(mentions) % 25 == 0 or (max_tweets is not None and main_tweet_count == max_tweets):
+                logger.debug("Terkumpul %d item dari X (termasuk komentar)...", len(mentions))
     except Exception as exc:
         logger.error("Terjadi error saat search di X: %s", exc)
 
-    logger.info("Selesai crawl X. Total didapatkan: %d item (termasuk komentar).", len(mentions))
+    logger.debug("Selesai crawl X. Total didapatkan: %d item (termasuk komentar).", len(mentions))
     return mentions
 
 
 def scrape_twitter(
-    query: str,
+    query: str = "",
     since_date: date | datetime | None = None,
     until_date: date | datetime | None = None,
-    max_tweets: int = 100,
+    max_tweets: int | None = 100,
     include_comments: bool = True,
     max_comments_per_tweet: int = 20,
     cookie_file: Path | str | None = None,
     db_file: Path | str | None = None,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
     """Wrapper sinkron untuk _scrape_twitter_async."""
     return asyncio.run(
@@ -218,5 +267,6 @@ def scrape_twitter(
             db_file=db_file,
             on_mention=on_mention,
             stop_event=stop_event,
+            account=account,
         )
     )

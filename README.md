@@ -59,6 +59,39 @@ Kapan saja saat proses crawling berjalan, Anda dapat menekan salah satu shortcut
 
 Semua perintah dijalankan menggunakan `uv run crawler`.
 
+### Mode Akun (Username / URL / File JSON) — Semua Platform
+Mendukung crawling seluruh postingan dari akun tertentu (tanpa batas tanggal wajib, dan tanpa batas jumlah post secara default):
+```bash
+# Crawl semua video dari channel YouTube via URL (platform otomatis terdeteksi)
+uv run crawler scrape --account "https://www.youtube.com/@bapperidakulonprogo"
+
+# Crawl semua postingan akun Instagram, TikTok, Facebook, Threads, atau X via username atau URL
+uv run crawler scrape --platform instagram --account "setdakp"
+uv run crawler scrape --account "https://www.tiktok.com/@bapperidakp"
+uv run crawler scrape --account "https://www.facebook.com/profile.php?id=61577862436420"
+uv run crawler scrape --account "https://www.threads.com/@irda.kulonprogo"
+uv run crawler scrape --account "https://x.com/bapperida"
+
+# Opsional: batasi rentang bulan / maksimal item jika diperlukan
+uv run crawler scrape --account "https://www.instagram.com/setdakp/" --months 3 --max-results 50
+
+# Batch crawl banyak akun sekaligus dari file JSON (paralel antar-platform)
+uv run crawler scrape --account-file accounts.json
+```
+Contoh format `accounts.json`:
+```json
+{
+  "youtube": ["https://www.youtube.com/@bapperidakulonprogo"],
+  "instagram": ["setdakp", "bapperidakp"],
+  "x": ["bapperida"],
+  "tiktok": ["@bapperidakp"],
+  "facebook": ["https://www.facebook.com/profile.php?id=61577862436420"],
+  "threads": ["https://www.threads.com/@irda.kulonprogo"]
+}
+```
+
+---
+
 ### A. YouTube
 Menggunakan `scrapetube` + `yt-dlp` (mengekstrak metadata video dan semua komentar).
 ```bash

@@ -10,30 +10,44 @@ import scrapetube
 import yt_dlp
 
 from ..models import CrawledMention
+from ..utils.accounts import parse_account_target
 from ..utils.cookies import find_platform_cookie
 
 logger = logging.getLogger(__name__)
 
 
 def scrape_youtube(
-    query: str,
+    query: str = "",
     since_date: datetime | None = None,
-    max_videos: int = 50,
+    max_videos: int | None = 50,
     include_comments: bool = True,
     max_comments_per_video: int = 50,
     cookie_file: Path | str | None = None,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
-    """Crawl video YouTube dan komentarnya berdasarkan kata kunci pencarian."""
+    """Crawl video YouTube dan komentarnya berdasarkan kata kunci pencarian atau akun channel."""
     if cookie_file is None:
         cookie_file = find_platform_cookie("youtube")
 
-    logger.info("Mencari video YouTube untuk query: '%s'...", query)
-    
-    # 1. Cari video dengan scrapetube
+    # 1. Cari video dengan scrapetube (channel videos vs keyword search)
     try:
-        videos_generator: Generator = scrapetube.get_search(query, results_type="video")
+        if account:
+            target = parse_account_target(account, "youtube")
+            logger.debug("Mengambil video channel YouTube: %s (%s)...", target.identifier, target.url)
+            videos_generator: Generator = scrapetube.get_channel(
+                channel_url=target.url,
+                limit=None,
+                sort_by="newest",
+                content_type="videos",
+            )
+        else:
+            if not query:
+                logger.error("YouTube memerlukan argumen --query atau --account.")
+                return []
+            logger.debug("Mencari video YouTube untuk query: '%s'...", query)
+            videos_generator = scrapetube.get_search(query, results_type="video")
     except Exception as exc:
         logger.error("Gagal melakukan pencarian video di YouTube: %s", exc)
         return []
@@ -43,7 +57,7 @@ def scrape_youtube(
     inspected_count = 0
     consecutive_out_of_date = 0
     max_consecutive_out_of_date = 10
-    max_inspected = max(30, max_videos * 3)
+    max_inspected = max(30, max_videos * 3) if max_videos is not None else None
 
     ydl_opts = {
         "skip_download": True,
@@ -54,16 +68,16 @@ def scrape_youtube(
     }
     if cookie_file and Path(cookie_file).is_file():
         ydl_opts["cookiefile"] = str(cookie_file)
-        logger.info("Menggunakan cookie file YouTube: %s", cookie_file)
+        logger.debug("Menggunakan cookie file YouTube: %s", cookie_file)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for item in videos_generator:
-            if processed_count >= max_videos:
+            if max_videos is not None and processed_count >= max_videos:
                 break
 
             inspected_count += 1
-            if inspected_count > max_inspected:
-                logger.info(
+            if max_inspected is not None and inspected_count > max_inspected:
+                logger.debug(
                     "[Circuit Breaker] Mencapai batas maksimal inspeksi video (%d). "
                     "Menghentikan pencarian YouTube agar tidak looping tak terbatas.",
                     max_inspected,
@@ -109,7 +123,7 @@ def scrape_youtube(
                     max_consecutive_out_of_date,
                 )
                 if consecutive_out_of_date >= max_consecutive_out_of_date:
-                    logger.info(
+                    logger.debug(
                         "[Circuit Breaker] Menemukan %d video berturut-turut yang sudah melewati batas waktu %s. "
                         "Pencarian YouTube dihentikan karena hasil telah memasuki riwayat lama.",
                         consecutive_out_of_date,
@@ -135,6 +149,7 @@ def scrape_youtube(
                 external_id=f"yt-{video_id}",
                 url=video_url,
                 content=content,
+                media_type="video",
                 author=uploader_id,
                 author_name=uploader,
                 published_at=pub_date,
@@ -155,7 +170,9 @@ def scrape_youtube(
                 except Exception as exc:
                     logger.debug("Error saat menjalankan on_mention callback: %s", exc)
             processed_count += 1
-            logger.info("[%d/%d] Terambil video: %s (%s)", processed_count, max_videos, title[:50], pub_date.date())
+            limit_label = str(max_videos) if max_videos is not None else "∞"
+            pub_label = pub_date.date() if pub_date else "unknown"
+            logger.debug("[%d/%s] Terambil video: %s (%s)", processed_count, limit_label, title[:50], pub_label)
 
             # Ekstraksi Komentar jika ada
             if include_comments and info.get("comments"):
@@ -204,5 +221,5 @@ def scrape_youtube(
             else:
                 time.sleep(jitter)
 
-    logger.info("Total item YouTube yang berhasil dikumpulkan: %d (termasuk komentar)", len(mentions))
+    logger.debug("Total item YouTube yang berhasil dikumpulkan: %d (termasuk komentar)", len(mentions))
     return mentions

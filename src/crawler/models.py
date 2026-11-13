@@ -13,6 +13,7 @@ class CrawledMention(BaseModel):
     external_id: str
     url: str
     content: str = ""
+    media_type: str = "text"
     author: str = ""
     author_name: str | None = None
     published_at: datetime | None = None
@@ -32,6 +33,7 @@ class CrawledMention(BaseModel):
             "external_id": self.external_id,
             "url": self.url,
             "content": self.content,
+            "media_type": self.media_type,
             "author": self.author,
             "published_at": self.published_at.isoformat() if self.published_at else None,
             "crawled_at": self.crawled_at.isoformat() if self.crawled_at else None,

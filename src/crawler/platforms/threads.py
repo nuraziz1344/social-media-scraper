@@ -11,6 +11,7 @@ from typing import Any
 from playwright.async_api import Response, async_playwright
 
 from ..models import CrawledMention
+from ..utils.accounts import parse_account_target
 from ..utils.cookies import find_platform_cookie, to_playwright_storage_state
 from ..utils.snowflake import decode_instagram_shortcode
 
@@ -48,11 +49,23 @@ def _parse_threads_post(post: dict[str, Any], parent_external_id: str | None = N
 
     url = f"https://www.threads.net/@{username}/post/{post_code}"
 
+    if post.get("carousel_media"):
+        media_type = "carousel"
+    elif post.get("video_versions"):
+        media_type = "video"
+    elif (post.get("image_versions2") or {}).get("candidates") or post.get("media_type") == 1:
+        media_type = "image"
+    elif (post.get("text_post_app_info") or {}).get("link_preview_attachment"):
+        media_type = "link"
+    else:
+        media_type = "text"
+
     return CrawledMention(
         platform="threads",
         external_id=f"th-{post_code}",
         url=url,
         content=text,
+        media_type=media_type,
         author=username,
         author_name=full_name,
         published_at=pub_date,
@@ -90,25 +103,60 @@ def _extract_threads_posts_and_replies(obj: Any, results: list[tuple[dict, str |
 
 
 async def _scrape_threads_async(
-    query: str,
+    query: str = "",
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     cookie_file: Path | str | None = None,
     headless: bool = True,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
-    """Scrape postingan Threads via Playwright dan GraphQL interception."""
+    """Scrape postingan Threads via Playwright dan GraphQL/SSR interception."""
     if cookie_file is None:
         cookie_file = find_platform_cookie("threads") or find_platform_cookie("instagram")
 
     storage_state = None
     if cookie_file and Path(cookie_file).is_file():
-        logger.info("Memuat cookie Threads dari: %s", cookie_file)
+        logger.debug("Memuat cookie Threads dari: %s", cookie_file)
         storage_state = to_playwright_storage_state(cookie_file)
+
+    if account:
+        target = parse_account_target(account, "threads")
+        target_url = target.url
+    else:
+        if not query:
+            logger.error("Threads memerlukan argumen --query atau --account.")
+            return []
+        encoded_query = urllib.parse.quote(query)
+        target_url = f"https://www.threads.com/search?q={encoded_query}"
 
     mentions: list[CrawledMention] = []
     seen_ids: set[str] = set()
+    main_post_count = 0
+
+    def _record_raw_posts(raw_posts: list[tuple[dict, str | None]]):
+        nonlocal main_post_count
+        for p_dict, parent_id in raw_posts:
+            if parent_id is None and max_posts is not None and main_post_count >= max_posts:
+                break
+            mention = _parse_threads_post(p_dict, parent_external_id=parent_id)
+            if mention and mention.external_id not in seen_ids:
+                if since_date and mention.published_at and mention.published_at < since_date:
+                    continue
+                seen_ids.add(mention.external_id)
+                mentions.append(mention)
+                if parent_id is None:
+                    main_post_count += 1
+                if on_mention:
+                    try:
+                        on_mention(mention)
+                    except Exception as exc:
+                        logger.debug("Error on_mention Threads: %s", exc)
+                if parent_id:
+                    logger.debug("[Threads] Menangkap balasan/komentar: %s (@%s -> %s)", mention.external_id, mention.author, parent_id)
+                else:
+                    logger.debug("[Threads] Menangkap post: %s (@%s)", mention.external_id, mention.author)
 
     async def handle_response(response: Response):
         url = response.url
@@ -117,31 +165,11 @@ async def _scrape_threads_async(
                 data = await response.json()
                 data_obj = data.get("data", {})
                 # Cari struktur thread_items di data_obj
-                # Bisa di data.searchResults.edges atau data.feedData
                 raw_posts: list[tuple[dict, str | None]] = []
                 _extract_threads_posts_and_replies(data_obj, raw_posts)
-
-                for p_dict, parent_id in raw_posts:
-                    mention = _parse_threads_post(p_dict, parent_external_id=parent_id)
-                    if mention and mention.external_id not in seen_ids:
-                        if since_date and mention.published_at and mention.published_at < since_date:
-                            continue
-                        seen_ids.add(mention.external_id)
-                        mentions.append(mention)
-                        if on_mention:
-                            try:
-                                on_mention(mention)
-                            except Exception as exc:
-                                logger.debug("Error on_mention Threads: %s", exc)
-                        if parent_id:
-                            logger.info("[Threads] Menangkap balasan/komentar: %s (@%s -> %s)", mention.external_id, mention.author, parent_id)
-                        else:
-                            logger.info("[Threads] Menangkap post: %s (@%s)", mention.external_id, mention.author)
+                _record_raw_posts(raw_posts)
             except Exception as exc:
                 logger.debug("Error saat membaca payload GraphQL Threads: %s", exc)
-
-    encoded_query = urllib.parse.quote(query)
-    search_url = f"https://www.threads.net/search?q={encoded_query}"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -162,18 +190,35 @@ async def _scrape_threads_async(
         page = await context.new_page()
         page.on("response", handle_response)
 
-        logger.info("Membuka pencarian Threads: %s", search_url)
+        logger.debug("Membuka Threads: %s", target_url)
         try:
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(4)
+
+            # Ekstrak post awal yang tertanam di SSR <script type="application/json"> jika ada
+            try:
+                script_texts = await page.locator('script[type="application/json"]').all_text_contents()
+                for st in script_texts:
+                    if "thread_items" not in st:
+                        continue
+                    try:
+                        parsed = json.loads(st)
+                        ssr_posts: list[tuple[dict, str | None]] = []
+                        _extract_threads_posts_and_replies(parsed, ssr_posts)
+                        _record_raw_posts(ssr_posts)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # Scroll ke bawah secara bertahap
             scroll_count = 0
-            max_scrolls = max(8, (max_posts // 5) * 2)
+            max_scrolls = max(8, (max_posts // 5) * 2) if max_posts is not None else None
+            stagnant_limit = 5 if max_posts is None else 3
             stagnant_count = 0
             last_count = 0
 
-            while len(mentions) < max_posts and scroll_count < max_scrolls:
+            while (max_posts is None or main_post_count < max_posts) and (max_scrolls is None or scroll_count < max_scrolls):
                 if stop_event and stop_event.is_set():
                     logger.info("[Threads] Proses dihentikan oleh sinyal pengguna.")
                     break
@@ -185,13 +230,14 @@ async def _scrape_threads_async(
                         break
                     await asyncio.sleep(0.1)
 
-                current_count = len(mentions)
+                current_count = main_post_count
                 if current_count == last_count:
                     stagnant_count += 1
-                    if stagnant_count >= 3:
-                        logger.info(
-                            "[Circuit Breaker] Tidak ada data baru setelah 3 kali scroll berturut-turut. "
+                    if stagnant_count >= stagnant_limit:
+                        logger.debug(
+                            "[Circuit Breaker] Tidak ada data baru setelah %d kali scroll berturut-turut. "
                             "Menghentikan scrolling Threads (total didapatkan: %d).",
+                            stagnant_limit,
                             current_count,
                         )
                         break
@@ -204,18 +250,19 @@ async def _scrape_threads_async(
         finally:
             await browser.close()
 
-    logger.info("Total item Threads yang berhasil dikumpulkan: %d", len(mentions))
+    logger.debug("Total item Threads yang berhasil dikumpulkan: %d", len(mentions))
     return mentions
 
 
 def scrape_threads(
-    query: str,
+    query: str = "",
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     cookie_file: Path | str | None = None,
     headless: bool = True,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
     """Wrapper sinkron untuk _scrape_threads_async."""
     return asyncio.run(
@@ -227,5 +274,6 @@ def scrape_threads(
             headless=headless,
             on_mention=on_mention,
             stop_event=stop_event,
+            account=account,
         )
     )

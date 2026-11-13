@@ -1,5 +1,6 @@
 """Scraper Facebook menggunakan Playwright dan Network/DOM Interception."""
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -12,6 +13,7 @@ from typing import Any
 from playwright.async_api import Response, async_playwright
 
 from ..models import CrawledMention
+from ..utils.accounts import parse_account_target
 from ..utils.cookies import find_platform_cookie, to_playwright_storage_state
 
 logger = logging.getLogger(__name__)
@@ -62,14 +64,19 @@ def _extract_facebook_story_details(story: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stable_fb_id(text: str) -> str:
+    return hashlib.sha256(text[:120].encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
 async def _scrape_facebook_async(
-    query: str,
+    query: str = "",
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     cookie_file: Path | str | None = None,
     headless: bool = True,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
     """Scrape postingan Facebook dengan Playwright dan GraphQL interception."""
     if cookie_file is None:
@@ -83,8 +90,20 @@ async def _scrape_facebook_async(
 
     storage_state = None
     if cookie_file and Path(cookie_file).is_file():
-        logger.info("Memuat cookie Facebook dari: %s", cookie_file)
+        logger.debug("Memuat cookie Facebook dari: %s", cookie_file)
         storage_state = to_playwright_storage_state(cookie_file)
+
+    default_author_handle = "facebook_user"
+    if account:
+        target = parse_account_target(account, "facebook")
+        target_url = target.url
+        default_author_handle = target.identifier
+    else:
+        if not query:
+            logger.error("Facebook memerlukan argumen --query atau --account.")
+            return []
+        encoded_query = urllib.parse.quote(query)
+        target_url = f"https://www.facebook.com/search/posts/?q={encoded_query}"
 
     mentions: list[CrawledMention] = []
     seen_ids: set[str] = set()
@@ -112,10 +131,14 @@ async def _scrape_facebook_async(
                         stories.append(data_obj["serpResponse"])
                     elif "viewer" in data_obj:
                         stories.append(data_obj["viewer"])
+                    elif "node" in data_obj:
+                        stories.append(data_obj["node"])
                     else:
                         stories.append(data_obj)
 
                     for story in stories:
+                        if max_posts is not None and len(mentions) >= max_posts:
+                            break
                         texts = _extract_text_recursive(story, "text")
                         if not texts:
                             continue
@@ -129,22 +152,33 @@ async def _scrape_facebook_async(
                         if since_date and pub_date and pub_date < since_date:
                             continue
 
-                        # Generate pseudo-id jika ID eksplisit terbungkus
-                        item_id = str(hash(combined_content[:100]))[-10:]
-                        external_id = f"fb-{item_id}"
+                        external_id = f"fb-{_stable_fb_id(combined_content)}"
                         if external_id in seen_ids:
                             continue
 
                         seen_ids.add(external_id)
                         author_handle = story_details.get("author_handle") or "facebook_user"
+                        if author_handle == "facebook_user" and account:
+                            author_handle = default_author_handle
                         author_name = story_details.get("author_name") or author_handle
-                        post_url = story_details.get("post_url") or story_details.get("author_url") or "https://www.facebook.com"
+                        post_url = (
+                            story_details.get("post_url")
+                            or story_details.get("author_url")
+                            or (target_url if account else "https://www.facebook.com")
+                        )
+
+                        fb_media_type = "text"
+                        if any(v in post_url.lower() for v in ("/reel", "/watch", "/videos/")):
+                            fb_media_type = "video"
+                        elif any(v in post_url.lower() for v in ("/photo", "set=pcb.")):
+                            fb_media_type = "image"
 
                         m_obj = CrawledMention(
                             platform="facebook",
                             external_id=external_id,
                             url=post_url,
                             content=combined_content,
+                            media_type=fb_media_type,
                             author=author_handle,
                             author_name=author_name,
                             published_at=pub_date,
@@ -156,12 +190,9 @@ async def _scrape_facebook_async(
                                 on_mention(m_obj)
                             except Exception as exc:
                                 logger.debug("Error on_mention FB: %s", exc)
-                        logger.info("[Facebook] Menangkap post GraphQL (%s oleh %s)...", external_id, author_name)
+                        logger.debug("[Facebook] Menangkap post GraphQL (%s oleh %s)...", external_id, author_name)
             except Exception as exc:
                 logger.debug("Error saat membaca payload GraphQL FB: %s", exc)
-
-    encoded_query = urllib.parse.quote(query)
-    search_url = f"https://www.facebook.com/search/posts/?q={encoded_query}"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -182,21 +213,24 @@ async def _scrape_facebook_async(
         page = await context.new_page()
         page.on("response", handle_response)
 
-        logger.info("Membuka pencarian Facebook: %s", search_url)
+        logger.debug("Membuka Facebook: %s", target_url)
         try:
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(5)
 
             # Ekstraksi berbasis DOM sebagai pelengkap yang andal
             scroll_count = 0
-            max_scrolls = max(8, (max_posts // 5) * 2)
+            max_scrolls = max(8, (max_posts // 5) * 2) if max_posts is not None else None
+            stagnant_limit = 5 if max_posts is None else 3
             stagnant_count = 0
             last_count = 0
 
-            while len(mentions) < max_posts and scroll_count < max_scrolls:
+            while (max_posts is None or len(mentions) < max_posts) and (max_scrolls is None or scroll_count < max_scrolls):
                 # Ambil card postingan dari feed HTML
                 post_cards = await page.query_selector_all("div[role='feed'] > div, div[role='article']")
                 for card in post_cards:
+                    if max_posts is not None and len(mentions) >= max_posts:
+                        break
                     try:
                         # 1. Ekstrak konten bersih via div[dir="auto"] untuk menghindari teks noise 'Facebook Facebook...'
                         dir_autos = await card.query_selector_all('div[dir="auto"]')
@@ -217,8 +251,7 @@ async def _scrape_facebook_async(
                         if len(clean_content) < 15:
                             continue
 
-                        card_hash = str(abs(hash(clean_content[:80])))
-                        ext_id = f"fb-{card_hash}"
+                        ext_id = f"fb-{_stable_fb_id(clean_content)}"
                         if ext_id in seen_ids:
                             continue
 
@@ -269,14 +302,22 @@ async def _scrape_facebook_async(
                                 author_name = (await h_el.inner_text() or "").split("\n")[0].strip()
 
                         if not author_name:
-                            author_name = "Facebook User"
-                            author_handle = "facebook_user"
+                            author_name = default_author_handle if account else "Facebook User"
+                            author_handle = default_author_handle
                         elif author_handle == "facebook_user":
                             slug = re.sub(r"[^a-zA-Z0-9_]", "_", author_name.lower()).strip("_")
-                            author_handle = slug or "facebook_user"
+                            author_handle = slug or default_author_handle
 
                         if not post_href:
-                            post_href = author_url or "https://www.facebook.com"
+                            post_href = author_url or (target_url if account else "https://www.facebook.com")
+
+                        dom_media_type = "text"
+                        if any(v in post_href.lower() for v in ("/reel", "/watch", "/videos/")):
+                            dom_media_type = "video"
+                        elif any(v in post_href.lower() for v in ("/photo", "set=pcb.")) or await card.query_selector("img[src*='scontent']"):
+                            dom_media_type = "image"
+                        elif await card.query_selector("video"):
+                            dom_media_type = "video"
 
                         seen_ids.add(ext_id)
                         m_obj = CrawledMention(
@@ -284,6 +325,7 @@ async def _scrape_facebook_async(
                             external_id=ext_id,
                             url=post_href,
                             content=clean_content,
+                            media_type=dom_media_type,
                             author=author_handle,
                             author_name=author_name,
                             published_at=None,
@@ -294,7 +336,7 @@ async def _scrape_facebook_async(
                                 on_mention(m_obj)
                             except Exception as exc:
                                 logger.debug("Error on_mention FB DOM: %s", exc)
-                        logger.info("[Facebook] Menangkap post dari feed: %s (%s - %s)...", ext_id, author_name, post_href[:60])
+                        logger.debug("[Facebook] Menangkap post dari feed: %s (%s - %s)...", ext_id, author_name, post_href[:60])
                     except Exception:
                         pass
 
@@ -313,10 +355,11 @@ async def _scrape_facebook_async(
                 current_count = len(mentions)
                 if current_count == last_count:
                     stagnant_count += 1
-                    if stagnant_count >= 3:
-                        logger.info(
-                            "[Circuit Breaker] Tidak ada data baru setelah 3 kali scroll berturut-turut. "
+                    if stagnant_count >= stagnant_limit:
+                        logger.debug(
+                            "[Circuit Breaker] Tidak ada data baru setelah %d kali scroll berturut-turut. "
                             "Menghentikan scrolling Facebook (total didapatkan: %d).",
+                            stagnant_limit,
                             current_count,
                         )
                         break
@@ -329,18 +372,19 @@ async def _scrape_facebook_async(
         finally:
             await browser.close()
 
-    logger.info("Total item Facebook yang berhasil dikumpulkan: %d", len(mentions))
+    logger.debug("Total item Facebook yang berhasil dikumpulkan: %d", len(mentions))
     return mentions
 
 
 def scrape_facebook(
-    query: str,
+    query: str = "",
     since_date: datetime | None = None,
-    max_posts: int = 50,
+    max_posts: int | None = 50,
     cookie_file: Path | str | None = None,
     headless: bool = True,
     on_mention: Any = None,
     stop_event: Any = None,
+    account: str | None = None,
 ) -> list[CrawledMention]:
     """Wrapper sinkron untuk _scrape_facebook_async."""
     return asyncio.run(
@@ -352,5 +396,6 @@ def scrape_facebook(
             headless=headless,
             on_mention=on_mention,
             stop_event=stop_event,
+            account=account,
         )
     )
