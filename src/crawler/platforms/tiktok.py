@@ -12,7 +12,7 @@ from playwright.async_api import Response, async_playwright
 
 from ..models import CrawledMention
 from ..utils.accounts import parse_account_target
-from ..utils.cookies import find_platform_cookie, to_playwright_storage_state
+from ..utils.cookies import find_platform_cookie, persist_playwright_cookies, to_playwright_storage_state
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +290,7 @@ async def _scrape_tiktok_async(
         except Exception as exc:
             logger.error("Terjadi error saat otomasi TikTok: %s", exc)
         finally:
+            await persist_playwright_cookies(context, cookie_file, "tiktok")
             await browser.close()
 
     logger.debug("Total item TikTok yang berhasil dikumpulkan: %d", len(mentions))

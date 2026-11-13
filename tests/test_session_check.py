@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from crawler.utils.cookies import cookies_to_dict, merge_and_save_cookies, parse_netscape_cookies
 from crawler.utils.session_check import check_all_sessions, check_platform_session
 
 
@@ -89,6 +90,83 @@ class TestSessionCheck(unittest.TestCase):
         self.assertEqual(res.status, "valid")
         self.assertEqual(res.username, "@pemkabkp")
         self.assertTrue(res.live_valid)
+
+    def test_merge_and_save_cookies_updates_safely(self):
+        future_exp = int(time.time()) + 86400 * 30
+        ig_path = self.cookies_dir / "instagram.txt"
+        ig_path.write_text(
+            f"# Netscape HTTP Cookie File\n"
+            f".instagram.com\tTRUE\t/\tTRUE\t{future_exp}\tsessionid\torig_sess\n"
+            f".instagram.com\tTRUE\t/\tTRUE\t{future_exp}\tcsrftoken\told_csrf\n"
+            f".other.com\tTRUE\t/\tTRUE\t{future_exp}\tkeep_me\tuntouched\n",
+            encoding="utf-8",
+        )
+
+        # 1. Valid update refreshes csrftoken and adds rur, preserving .other.com
+        saved = merge_and_save_cookies(
+            ig_path,
+            [
+                {"name": "sessionid", "value": "orig_sess", "domain": ".instagram.com", "path": "/", "secure": True, "expires": future_exp},
+                {"name": "csrftoken", "value": "new_csrf", "domain": ".instagram.com", "path": "/", "secure": True, "expires": future_exp + 100},
+                {"name": "rur", "value": "ASH", "domain": ".instagram.com", "path": "/", "secure": True, "expires": future_exp},
+            ],
+            platform="instagram",
+        )
+        self.assertTrue(saved)
+        parsed = cookies_to_dict(parse_netscape_cookies(ig_path))
+        self.assertEqual(parsed["csrftoken"], "new_csrf")
+        self.assertEqual(parsed["rur"], "ASH")
+        self.assertEqual(parsed["keep_me"], "untouched")
+
+        # 2. No-op update returns False
+        saved_again = merge_and_save_cookies(
+            ig_path,
+            [
+                {"name": "sessionid", "value": "orig_sess", "domain": ".instagram.com", "path": "/", "secure": True, "expires": future_exp},
+                {"name": "csrftoken", "value": "new_csrf", "domain": ".instagram.com", "path": "/", "secure": True, "expires": future_exp + 100},
+            ],
+            platform="instagram",
+        )
+        self.assertFalse(saved_again)
+
+        # 3. Logged-out / missing sessionid update MUST NOT overwrite file
+        clobber = merge_and_save_cookies(
+            ig_path,
+            [
+                {"name": "sessionid", "value": "", "domain": ".instagram.com", "path": "/", "secure": True, "expires": 0},
+                {"name": "csrftoken", "value": "guest_csrf", "domain": ".instagram.com", "path": "/", "secure": True, "expires": future_exp},
+            ],
+            platform="instagram",
+        )
+        self.assertFalse(clobber)
+        after_clobber = cookies_to_dict(parse_netscape_cookies(ig_path))
+        self.assertEqual(after_clobber["sessionid"], "orig_sess")
+        self.assertEqual(after_clobber["csrftoken"], "new_csrf")
+
+    def test_merge_and_save_cookies_json_preserves_origins(self):
+        future_exp = int(time.time()) + 86400
+        tk_path = self.cookies_dir / "tiktok.json"
+        tk_path.write_text(
+            json.dumps({
+                "cookies": [
+                    {"name": "sessionid", "value": "s1", "domain": ".tiktok.com", "path": "/", "expires": future_exp}
+                ],
+                "origins": [{"origin": "https://www.tiktok.com", "localStorage": []}],
+            }),
+            encoding="utf-8",
+        )
+        saved = merge_and_save_cookies(
+            tk_path,
+            [
+                {"name": "sessionid", "value": "s1", "domain": ".tiktok.com", "path": "/", "expires": future_exp},
+                {"name": "ttwid", "value": "t123", "domain": ".tiktok.com", "path": "/", "expires": future_exp},
+            ],
+            platform="tiktok",
+        )
+        self.assertTrue(saved)
+        data = json.loads(tk_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(data["origins"]), 1)
+        self.assertEqual({c["name"]: c["value"] for c in data["cookies"]}["ttwid"], "t123")
 
 
 if __name__ == "__main__":

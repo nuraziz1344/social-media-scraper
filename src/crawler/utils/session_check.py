@@ -1,32 +1,24 @@
 """Utilitas pengecekan validitas session / cookie untuk setiap platform."""
-import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import httpx
 
 from .accounts import normalize_platform
-from .cookies import CookieEntry, find_platform_cookie, parse_netscape_cookies
+from .cookies import (
+    REQUIRED_SESSION_COOKIES,
+    CookieEntry,
+    find_platform_cookie,
+    load_cookie_entries,
+)
 
 logger = logging.getLogger("crawler.session_check")
 
 ALL_PLATFORMS = ("youtube", "x", "instagram", "tiktok", "facebook", "threads")
-
-# Cookie esensial yang menandakan session login aktif per platform
-REQUIRED_SESSION_COOKIES: dict[str, tuple[tuple[str, ...], ...]] = {
-    # Setiap inner-tuple adalah alternatif (minimal salah satu ada)
-    "x": (("auth_token",), ("ct0",)),
-    "instagram": (("sessionid",), ("csrftoken",)),
-    "threads": (("sessionid",), ("csrftoken",)),
-    "facebook": (("c_user",), ("xs",)),
-    "tiktok": (("sessionid", "sid_tt", "sessionid_ss"),),
-    "youtube": (),  # YouTube opsional (bisa tanpa cookie)
-}
 
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,32 +39,6 @@ class SessionCheckResult:
     username: str | None = None
     status: str = "unknown"  # valid | expired | invalid | missing | optional | error
     detail: str = ""
-
-
-def load_cookie_entries(cookie_path: Path) -> list[CookieEntry]:
-    """Muat cookie dari file .txt (Netscape) atau .json (Playwright storage_state)."""
-    if cookie_path.suffix.lower() == ".json":
-        with open(cookie_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        raw_cookies = data.get("cookies", []) if isinstance(data, dict) else []
-        entries: list[CookieEntry] = []
-        for c in raw_cookies:
-            if not isinstance(c, dict):
-                continue
-            entries.append(
-                CookieEntry(
-                    domain=str(c.get("domain", "")),
-                    include_subdomains=True,
-                    path=str(c.get("path", "/")),
-                    secure=bool(c.get("secure", False)),
-                    expires=int(float(c.get("expires", -1) or -1)),
-                    name=str(c.get("name", "")),
-                    value=str(c.get("value", "")),
-                )
-            )
-        return entries
-
-    return parse_netscape_cookies(cookie_path)
 
 
 def _evaluate_local_cookies(
